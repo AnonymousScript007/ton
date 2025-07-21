@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.0.2 FATAL_ERROR)
+option(TONLIBJSON_STATIC "Build tonlibjson as static library" OFF)
 
 if (NOT OPENSSL_FOUND)
   find_package(OpenSSL REQUIRED)
@@ -8,7 +8,6 @@ set(TONLIB_SOURCE
   tonlib/Client.cpp
   tonlib/Config.cpp
   tonlib/ExtClient.cpp
-  tonlib/ExtClientLazy.cpp
   tonlib/ExtClientOutbound.cpp
   tonlib/KeyStorage.cpp
   tonlib/KeyValue.cpp
@@ -17,12 +16,12 @@ set(TONLIB_SOURCE
   tonlib/LastConfig.cpp
   tonlib/Logging.cpp
   tonlib/TonlibClient.cpp
+  tonlib/TonlibClientWrapper.cpp
   tonlib/utils.cpp
 
   tonlib/Client.h
   tonlib/Config.h
   tonlib/ExtClient.h
-  tonlib/ExtClientLazy.h
   tonlib/ExtClientOutbound.h
   tonlib/KeyStorage.h
   tonlib/KeyValue.h
@@ -32,6 +31,7 @@ set(TONLIB_SOURCE
   tonlib/Logging.h
   tonlib/TonlibCallback.h
   tonlib/TonlibClient.h
+  tonlib/TonlibClientWrapper.h
   tonlib/utils.h
 
   tonlib/keys/bip39.cpp
@@ -49,6 +49,8 @@ set(TONLIB_SOURCE
 set(TONLIB_OFFLINE_TEST_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/test/offline.cpp PARENT_SCOPE)
 set(TONLIB_ONLINE_TEST_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/test/online.cpp PARENT_SCOPE)
 
+set(USE_EMSCRIPTEN ${USE_EMSCRIPTEN} PARENT_SCOPE)
+
 add_library(tonlib STATIC ${TONLIB_SOURCE})
 
 target_include_directories(tonlib PUBLIC
@@ -56,7 +58,7 @@ target_include_directories(tonlib PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>/..
   $<BUILD_INTERFACE:${OPENSSL_INCLUDE_DIR}>
 )
-target_link_libraries(tonlib PRIVATE tdactor adnllite tl_lite_api tl-lite-utils ton_crypto ton_block lite-client-common smc-envelope)
+target_link_libraries(tonlib PRIVATE tdactor adnllite tl_lite_api tl-lite-utils ton_crypto lite-client-common smc-envelope emulator_static)
 target_link_libraries(tonlib PUBLIC tdutils tl_tonlib_api)
 
 if (TONLIB_ENABLE_JNI AND NOT ANDROID) # jni is available by default on Android
@@ -65,6 +67,7 @@ if (TONLIB_ENABLE_JNI AND NOT ANDROID) # jni is available by default on Android
   endif()
   message(STATUS "Found JNI: ${JNI_INCLUDE_DIRS} ${JNI_LIBRARIES}")
   target_include_directories(tonlib PUBLIC ${JAVA_INCLUDE_PATH} ${JAVA_INCLUDE_PATH2})
+  target_include_directories(tl_tonlib_api PUBLIC ${JAVA_INCLUDE_PATH} ${JAVA_INCLUDE_PATH2})
   target_link_libraries(tonlib PUBLIC ${JAVA_JVM_LIBRARY})
 endif()
 
@@ -87,23 +90,28 @@ set(TONLIB_JSON_HEADERS tonlib/tonlib_client_json.h)
 set(TONLIB_JSON_SOURCE tonlib/tonlib_client_json.cpp)
 
 include(GenerateExportHeader)
+if (TONLIBJSON_STATIC OR USE_EMSCRIPTEN)
+  add_library(tonlibjson STATIC ${TONLIB_JSON_SOURCE})
+else()
+  add_library(tonlibjson SHARED ${TONLIB_JSON_SOURCE})
+endif()
 
-add_library(tonlibjson SHARED ${TONLIB_JSON_SOURCE} ${TONLIB_JSON_HEADERS})
-target_link_libraries(tonlibjson PRIVATE tonlibjson_private)
+if (PORTABLE AND NOT APPLE)
+  target_link_libraries(tonlibjson PRIVATE tonlibjson_private -static-libgcc -static-libstdc++)
+else()
+  target_link_libraries(tonlibjson PRIVATE tonlibjson_private)
+endif()
+
 generate_export_header(tonlibjson EXPORT_FILE_NAME ${CMAKE_CURRENT_BINARY_DIR}/tonlib/tonlibjson_export.h)
+if (TONLIBJSON_STATIC OR USE_EMSCRIPTEN)
+  target_compile_definitions(tonlibjson PUBLIC TONLIBJSON_STATIC_DEFINE)
+endif()
 target_include_directories(tonlibjson PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}>
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>)
 if (APPLE)
   set_target_properties(tonlibjson PROPERTIES LINK_FLAGS "-Wl,-exported_symbols_list,${CMAKE_CURRENT_SOURCE_DIR}/tonlibclientjson_export_list")
 endif()
-
-add_library(tonlibjson_static STATIC ${TONLIB_JSON_SOURCE} ${TONLIB_JSON_HEADERS})
-target_link_libraries(tonlibjson_static PRIVATE tonlibjson_private)
-target_compile_definitions(tonlibjson_static PUBLIC TONLIBJSON_STATIC_DEFINE)
-target_include_directories(tonlibjson_static PUBLIC
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}>
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>)
 
 add_library(TonlibJson INTERFACE)
 target_link_libraries(TonlibJson INTERFACE tonlibjson)
@@ -126,8 +134,8 @@ if (NOT TON_USE_ABSEIL)
 if (WIN32)
   set(WINGETOPT_TARGET wingetopt)
 endif()
-install(TARGETS tdnet keys crc32c tdactor adnllite tl_api tl-utils tl_lite_api tl-lite-utils ton_crypto ton_block smc-envelope ${WINGETOPT_TARGET}
-  tdutils tl_tonlib_api tonlib lite-client-common tddb_utils Tonlib EXPORT Tonlib
+install(TARGETS tdnet keys crc32c tdactor adnllite tl_api tl-utils tl_lite_api tl-lite-utils ton_crypto ton_crypto_core ton_block smc-envelope ${WINGETOPT_TARGET}
+  tdutils tl_tonlib_api tonlib lite-client-common tddb_utils emulator_static Tonlib EXPORT Tonlib
   LIBRARY DESTINATION lib
   ARCHIVE DESTINATION lib
   RUNTIME DESTINATION bin
@@ -149,11 +157,17 @@ endif()
 
 install(FILES ${TONLIB_JSON_HEADERS} ${CMAKE_CURRENT_BINARY_DIR}/tonlib/tonlibjson_export.h DESTINATION include/tonlib/)
 
-install(EXPORT Tonlib
-  FILE TonlibTargets.cmake
-  NAMESPACE Tonlib::
-  DESTINATION lib/cmake/Tonlib
-)
+if (NOT USE_EMSCRIPTEN AND NOT TONLIBJSON_STATIC)
+  install(EXPORT Tonlib
+    FILE TonlibTargets.cmake
+    NAMESPACE Tonlib::
+    DESTINATION lib/cmake/Tonlib
+  )
+
+  # Add SOVERSION to shared libraries
+  set_property(TARGET tonlibjson PROPERTY SOVERSION ${TON_VERSION})
+endif()
+
 include(CMakePackageConfigHelpers)
 write_basic_package_version_file("TonlibConfigVersion.cmake"
   VERSION ${TON_VERSION}
@@ -163,6 +177,4 @@ install(FILES "TonlibConfig.cmake" "${CMAKE_CURRENT_BINARY_DIR}/TonlibConfigVers
   DESTINATION lib/cmake/Tonlib
 )
 
-# Add SOVERSION to shared libraries
-set_property(TARGET tonlibjson PROPERTY SOVERSION ${TON_VERSION})
 install(TARGETS tonlib-cli RUNTIME DESTINATION bin)

@@ -21,6 +21,10 @@
 #include "vm/dict.h"
 #include "vm/log.h"
 #include "vm/vm.h"
+#include "cp0.h"
+#include "memo.h"
+
+#include <sodium.h>
 
 namespace vm {
 
@@ -29,33 +33,8 @@ VmState::VmState() : cp(-1), dispatch(&dummy_dispatch_table), quit0(true, 0), qu
   init_cregs();
 }
 
-VmState::VmState(Ref<CellSlice> _code)
-    : code(std::move(_code)), cp(-1), dispatch(&dummy_dispatch_table), quit0(true, 0), quit1(true, 1) {
-  ensure_throw(init_cp(0));
-  init_cregs();
-}
-
-VmState::VmState(Ref<CellSlice> _code, Ref<Stack> _stack, int flags, Ref<Cell> _data, VmLog log,
-                 std::vector<Ref<Cell>> _libraries, Ref<Tuple> init_c7)
-    : code(std::move(_code))
-    , stack(std::move(_stack))
-    , cp(-1)
-    , dispatch(&dummy_dispatch_table)
-    , quit0(true, 0)
-    , quit1(true, 1)
-    , log(log)
-    , libraries(std::move(_libraries))
-    , stack_trace((flags >> 2) & 1) {
-  ensure_throw(init_cp(0));
-  set_c4(std::move(_data));
-  if (init_c7.not_null()) {
-    set_c7(std::move(init_c7));
-  }
-  init_cregs(flags & 1, flags & 2);
-}
-
-VmState::VmState(Ref<CellSlice> _code, Ref<Stack> _stack, const GasLimits& gas, int flags, Ref<Cell> _data, VmLog log,
-                 std::vector<Ref<Cell>> _libraries, Ref<Tuple> init_c7)
+VmState::VmState(Ref<CellSlice> _code, int global_version, Ref<Stack> _stack, const GasLimits& gas, int flags,
+                 Ref<Cell> _data, VmLog log, std::vector<Ref<Cell>> _libraries, Ref<Tuple> init_c7)
     : code(std::move(_code))
     , stack(std::move(_stack))
     , cp(-1)
@@ -65,7 +44,8 @@ VmState::VmState(Ref<CellSlice> _code, Ref<Stack> _stack, const GasLimits& gas, 
     , log(log)
     , gas(gas)
     , libraries(std::move(_libraries))
-    , stack_trace((flags >> 2) & 1) {
+    , stack_trace((flags >> 2) & 1)
+    , global_version(global_version) {
   ensure_throw(init_cp(0));
   set_c4(std::move(_data));
   if (init_c7.not_null()) {
@@ -100,12 +80,24 @@ void VmState::init_cregs(bool same_c3, bool push_0) {
   }
 }
 
-Ref<CellSlice> VmState::convert_code_cell(Ref<Cell> code_cell) {
+Ref<CellSlice> VmState::convert_code_cell(Ref<Cell> code_cell, int global_version,
+                                          const std::vector<Ref<Cell>>& libraries) {
   if (code_cell.is_null()) {
     return {};
   }
-  Ref<CellSlice> csr{true, NoVmOrd(), code_cell};
-  if (csr->is_valid()) {
+  Ref<CellSlice> csr;
+  if (global_version >= 9) {
+    // Use DummyVmState instead of this to avoid consuming gas for cell loading
+    DummyVmState dummy{libraries, global_version};
+    Guard guard(&dummy);
+    try {
+      csr = load_cell_slice_ref(code_cell);
+    } catch (VmError&) {  // NOLINT(*-empty-catch)
+    }
+  } else {
+    csr = td::Ref<CellSlice>{true, NoVmOrd(), code_cell};
+  }
+  if (csr.not_null() && csr->is_valid()) {
     return csr;
   }
   return load_cell_slice_ref(CellBuilder{}.store_ref(std::move(code_cell)).finalize());
@@ -255,6 +247,11 @@ int VmState::jump(Ref<Continuation> cont) {
 
 // general jump to continuation cont
 int VmState::jump(Ref<Continuation> cont, int pass_args) {
+  cont = adjust_jump_cont(std::move(cont), pass_args);
+  return jump_to(std::move(cont));
+}
+
+Ref<Continuation> VmState::adjust_jump_cont(Ref<Continuation> cont, int pass_args) {
   const ControlData* cont_data = cont->get_cdata();
   if (cont_data) {
     // first do the checks
@@ -295,7 +292,7 @@ int VmState::jump(Ref<Continuation> cont, int pass_args) {
         consume_stack_gas(copy);
       }
     }
-    return jump_to(std::move(cont));
+    return cont;
   } else {
     // have no continuation data, situation is somewhat simpler
     if (pass_args >= 0) {
@@ -307,7 +304,7 @@ int VmState::jump(Ref<Continuation> cont, int pass_args) {
         consume_stack_gas(pass_args);
       }
     }
-    return jump_to(std::move(cont));
+    return cont;
   }
 }
 
@@ -389,7 +386,7 @@ int VmState::throw_exception(int excno) {
   stack_ref.push_smallint(0);
   stack_ref.push_smallint(excno);
   code.clear();
-  gas.consume_chk(exception_gas_price);
+  consume_gas_chk(exception_gas_price);
   return jump(get_c2());
 }
 
@@ -399,7 +396,7 @@ int VmState::throw_exception(int excno, StackEntry&& arg) {
   stack_ref.push(std::move(arg));
   stack_ref.push_smallint(excno);
   code.clear();
-  gas.consume_chk(exception_gas_price);
+  consume_gas_chk(exception_gas_price);
   return jump(get_c2());
 }
 
@@ -433,63 +430,67 @@ void VmState::change_gas_limit(long long new_limit) {
 
 int VmState::step() {
   CHECK(code.not_null() && stack.not_null());
-  //VM_LOG(st) << "stack:";  stack->dump(VM_LOG(st));
-  //VM_LOG(st) << "; cr0.refcnt = " << get_c0()->get_refcnt() - 1 << std::endl;
+  if (log.log_mask & vm::VmLog::DumpStack) {
+    std::stringstream ss;
+    int mode = 3;
+    if (log.log_mask & vm::VmLog::DumpStackVerbose) {
+      mode += 4;
+    }
+    std::unique_ptr<VmStateInterface> tmp_ctx;
+    // install temporary dummy vm state interface to prevent charging for cell load operations during dump
+    VmStateInterface::Guard guard(tmp_ctx.get());
+    stack->dump(ss, mode);
+    VM_LOG(this) << "stack:" << ss.str();
+  }
   if (stack_trace) {
+    std::unique_ptr<VmStateInterface> tmp_ctx;
+    // install temporary dummy vm state interface to prevent charging for cell load operations during dump
+    VmStateInterface::Guard guard(tmp_ctx.get());
     stack->dump(std::cerr, 3);
   }
   ++steps;
   if (code->size()) {
+    VM_LOG_MASK(this, vm::VmLog::ExecLocation) << "code cell hash: " << code->get_base_cell()->get_hash().to_hex() << " offset: " << code->cur_pos();
     return dispatch->dispatch(this, code.write());
   } else if (code->size_refs()) {
     VM_LOG(this) << "execute implicit JMPREF";
-    gas.consume_chk(implicit_jmpref_gas_price);
-    Ref<Continuation> cont = Ref<OrdCont>{true, load_cell_slice_ref(code->prefetch_ref()), get_cp()};
+    auto ref_cell = code->prefetch_ref();
+    VM_LOG_MASK(this, vm::VmLog::ExecLocation) << "code cell hash: " << ref_cell->get_hash().to_hex() << " offset: 0";
+    consume_gas_chk(implicit_jmpref_gas_price);
+    Ref<Continuation> cont = Ref<OrdCont>{true, load_cell_slice_ref(std::move(ref_cell)), get_cp()};
     return jump(std::move(cont));
   } else {
     VM_LOG(this) << "execute implicit RET";
-    gas.consume_chk(implicit_ret_gas_price);
+    consume_gas_chk(implicit_ret_gas_price);
     return ret();
   }
 }
 
-int VmState::run() {
-  if (code.is_null() || stack.is_null()) {
-    // throw VmError{Excno::fatal, "cannot run an uninitialized VM"};
-    return (int)Excno::fatal;  // no ~ for unhandled exceptions
-  }
+int VmState::run_inner() {
   int res;
   Guard guard(this);
   do {
     try {
       try {
-        try {
-          res = step();
-          gas.check();
-        } catch (vm::CellBuilder::CellWriteError) {
-          throw VmError{Excno::cell_ov};
-        } catch (vm::CellBuilder::CellCreateError) {
-          throw VmError{Excno::cell_ov};
-        } catch (vm::CellSlice::CellReadError) {
-          throw VmError{Excno::cell_und};
-        }
-      } catch (const VmError& vme) {
-        VM_LOG(this) << "handling exception code " << vme.get_errno() << ": " << vme.get_msg();
-        try {
-          ++steps;
-          res = throw_exception(vme.get_errno());
-        } catch (const VmError& vme2) {
-          VM_LOG(this) << "exception " << vme2.get_errno() << " while handling exception: " << vme.get_msg();
-          return ~vme2.get_errno();
-        }
+        res = step();
+        VM_LOG_MASK(this, vm::VmLog::GasRemaining) << "gas remaining: " << gas.gas_remaining;
+        gas.check();
+      } catch (vm::CellBuilder::CellWriteError) {
+        throw VmError{Excno::cell_ov};
+      } catch (vm::CellBuilder::CellCreateError) {
+        throw VmError{Excno::cell_ov};
+      } catch (vm::CellSlice::CellReadError) {
+        throw VmError{Excno::cell_und};
       }
-    } catch (VmNoGas vmoog) {
-      ++steps;
-      VM_LOG(this) << "unhandled out-of-gas exception: gas consumed=" << gas.gas_consumed()
-                   << ", limit=" << gas.gas_limit;
-      get_stack().clear();
-      get_stack().push_smallint(gas.gas_consumed());
-      return vmoog.get_errno();  // no ~ for unhandled exceptions (to make their faking impossible)
+    } catch (const VmError& vme) {
+      VM_LOG(this) << "handling exception code " << vme.get_errno() << ": " << vme.get_msg();
+      try {
+        ++steps;
+        res = throw_exception(vme.get_errno());
+      } catch (const VmError& vme2) {
+        VM_LOG(this) << "exception " << vme2.get_errno() << " while handling exception: " << vme.get_msg();
+        return ~vme2.get_errno();
+      }
     }
   } while (!res);
   if ((res | 1) == -1 && !try_commit()) {
@@ -501,9 +502,44 @@ int VmState::run() {
   return res;
 }
 
+int VmState::run() {
+  if (code.is_null() || stack.is_null()) {
+    // throw VmError{Excno::fatal, "cannot run an uninitialized VM"};
+    return (int)Excno::fatal;  // no ~ for unhandled exceptions
+  }
+  int res = 0;
+  bool restore_parent = false;
+  while (true) {
+    try {
+      if (restore_parent) {
+        restore_parent_vm(~res);
+      }
+      res = run_inner();
+    } catch (VmNoGas &vmoog) {
+      ++steps;
+      VM_LOG(this) << "unhandled out-of-gas exception: gas consumed=" << gas.gas_consumed()
+                   << ", limit=" << gas.gas_limit;
+      get_stack().clear();
+      get_stack().push_smallint(gas.gas_consumed());
+      res = vmoog.get_errno();  // no ~ for unhandled exceptions (to make their faking impossible)
+    }
+    if (!parent) {
+      if ((log.log_mask & VmLog::DumpC5) && cstate.committed) {
+        std::stringstream ss;
+        ss << "final c5: ";
+        StackEntry::maybe<Cell>(cstate.c5).dump(ss, true);
+        ss << "\n";
+        VM_LOG(this) << ss.str();
+      }
+      return res;
+    }
+    restore_parent = true;
+  }
+}
+
 bool VmState::try_commit() {
   if (cr.d[0].not_null() && cr.d[1].not_null() && cr.d[0]->get_depth() <= max_data_depth &&
-      cr.d[1]->get_depth() <= max_data_depth) {
+      cr.d[1]->get_depth() <= max_data_depth && cr.d[0]->get_level() == 0 && cr.d[1]->get_level() == 0) {
     cstate.c4 = cr.d[0];
     cstate.c5 = cr.d[1];
     cstate.committed = true;
@@ -533,8 +569,10 @@ ControlRegs* force_cregs(Ref<Continuation>& cont) {
 }
 
 int run_vm_code(Ref<CellSlice> code, Ref<Stack>& stack, int flags, Ref<Cell>* data_ptr, VmLog log, long long* steps,
-                GasLimits* gas_limits, std::vector<Ref<Cell>> libraries, Ref<Tuple> init_c7, Ref<Cell>* actions_ptr) {
+                GasLimits* gas_limits, std::vector<Ref<Cell>> libraries, Ref<Tuple> init_c7, Ref<Cell>* actions_ptr,
+                int global_version) {
   VmState vm{code,
+             global_version,
              std::move(stack),
              gas_limits ? *gas_limits : GasLimits{},
              flags,
@@ -571,12 +609,13 @@ int run_vm_code(Ref<CellSlice> code, Ref<Stack>& stack, int flags, Ref<Cell>* da
 }
 
 int run_vm_code(Ref<CellSlice> code, Stack& stack, int flags, Ref<Cell>* data_ptr, VmLog log, long long* steps,
-                GasLimits* gas_limits, std::vector<Ref<Cell>> libraries, Ref<Tuple> init_c7, Ref<Cell>* actions_ptr) {
+                GasLimits* gas_limits, std::vector<Ref<Cell>> libraries, Ref<Tuple> init_c7, Ref<Cell>* actions_ptr,
+                int global_version) {
   Ref<Stack> stk{true};
   stk.unique_write().set_contents(std::move(stack));
   stack.clear();
   int res = run_vm_code(code, stk, flags, data_ptr, log, steps, gas_limits, std::move(libraries), std::move(init_c7),
-                        actions_ptr);
+                        actions_ptr, global_version);
   CHECK(stack.is_unique());
   if (stk.is_null()) {
     stack.clear();
@@ -597,13 +636,14 @@ int run_vm_code(Ref<CellSlice> code, Stack& stack, int flags, Ref<Cell>* data_pt
 Ref<Cell> VmState::load_library(td::ConstBitPtr hash) {
   std::unique_ptr<VmStateInterface> tmp_ctx;
   // install temporary dummy vm state interface to prevent charging for cell load operations during library lookup
-  VmStateInterface::Guard(tmp_ctx.get());
+  VmStateInterface::Guard guard{global_version >= 4 ? tmp_ctx.get() : VmStateInterface::get()};
   for (const auto& lib_collection : libraries) {
     auto lib = lookup_library_in(hash, lib_collection);
     if (lib.not_null()) {
       return lib;
     }
   }
+  missing_library = td::Bits256{hash};
   return {};
 }
 
@@ -620,9 +660,6 @@ void VmState::register_cell_load(const CellHash& cell_hash) {
     consume_gas(cell_load_gas_price);
   } else {
     auto ok = loaded_cells.insert(cell_hash);  // check whether this is the first time this cell is loaded
-    if (ok.second) {
-      loaded_cells_count++;
-    }
     consume_gas(ok.second ? cell_load_gas_price : cell_reload_gas_price);
   }
 }
@@ -667,6 +704,91 @@ Ref<vm::Cell> lookup_library_in(td::ConstBitPtr key, Ref<vm::Cell> lib_root) {
   }
   vm::Dictionary dict{std::move(lib_root), 256};
   return lookup_library_in(key, dict);
+}
+
+void VmState::run_child_vm(VmState&& new_state, bool return_data, bool return_actions, bool return_gas,
+                           bool isolate_gas, int ret_vals) {
+  new_state.log = std::move(log);
+  new_state.libraries = std::move(libraries);
+  new_state.stack_trace = stack_trace;
+  new_state.max_data_depth = max_data_depth;
+  if (!isolate_gas) {
+    new_state.loaded_cells = std::move(loaded_cells);
+  } else {
+    consume_gas(std::min<long long>(chksgn_counter, chksgn_free_count) * chksgn_gas_price);
+    chksgn_counter = 0;
+  }
+  new_state.chksgn_counter = chksgn_counter;
+
+  auto new_parent = std::make_unique<ParentVmState>();
+  new_parent->return_data = return_data;
+  new_parent->return_actions = return_actions;
+  new_parent->return_gas = return_gas;
+  new_parent->isolate_gas = isolate_gas;
+  new_parent->ret_vals = ret_vals;
+  new_parent->state = std::move(*this);
+  new_state.parent = std::move(new_parent);
+  *this = std::move(new_state);
+}
+
+void VmState::restore_parent_vm(int res) {
+  auto parent = std::move(this->parent);
+  CHECK(parent);
+  VmState child_state = std::move(*this);
+  *this = std::move(parent->state);
+  log = std::move(child_state.log);
+  libraries = std::move(child_state.libraries);
+  steps += child_state.steps;
+  if (!parent->isolate_gas) {
+    loaded_cells = std::move(child_state.loaded_cells);
+  }
+  chksgn_counter = child_state.chksgn_counter;
+  VM_LOG(this) << "Child VM finished. res: " << res << ", steps: " << child_state.steps
+               << ", gas: " << child_state.gas_consumed();
+
+  consume_gas(std::min(child_state.gas_consumed(), child_state.gas.gas_limit + 1));
+  Stack& cur_stack = get_stack();
+  int ret_cnt;
+  if (res == 0 || res == 1) {
+    if (parent->ret_vals >= 0) {
+      if (child_state.stack->depth() >= parent->ret_vals) {
+        ret_cnt = parent->ret_vals;
+      } else {
+        ret_cnt = 0;
+        res = ~(int)Excno::stk_und;
+        cur_stack.push(td::zero_refint());
+      }
+    } else {
+      ret_cnt = child_state.stack->depth();
+    }
+  } else {
+    ret_cnt = std::min(child_state.stack->depth(), 1);
+  }
+  consume_stack_gas(ret_cnt);
+  for (int i = ret_cnt - 1; i >= 0; --i) {
+    cur_stack.push(std::move(child_state.stack->at(i)));
+  }
+  cur_stack.push_smallint(res);
+  if (parent->return_data) {
+    cur_stack.push_cell(child_state.get_committed_state().c4);
+  }
+  if (parent->return_actions) {
+    cur_stack.push_cell(child_state.get_committed_state().c5);
+  }
+  if (parent->return_gas) {
+    cur_stack.push_smallint(child_state.gas.gas_consumed());
+  }
+}
+
+td::Status init_vm(bool enable_debug) {
+  if (!init_op_cp0(enable_debug)) {
+    return td::Status::Error("Failed to init TVM: failed to init cp0");
+  }
+  auto code = sodium_init();
+  if (code < 0) {
+    return td::Status::Error(PSTRING() << "Failed to init TVM: sodium_init, code=" << code);
+  }
+  return td::Status::OK();
 }
 
 }  // namespace vm

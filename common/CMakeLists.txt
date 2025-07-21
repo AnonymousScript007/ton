@@ -1,5 +1,3 @@
-cmake_minimum_required(VERSION 3.0.2 FATAL_ERROR)
-
 set(COMMON_SOURCE
   checksum.h
   errorcode.h 
@@ -8,7 +6,8 @@ set(COMMON_SOURCE
 
   errorlog.h
   errorlog.cpp
-)
+
+  global-version.h)
 
 
 add_library(common STATIC ${COMMON_SOURCE})

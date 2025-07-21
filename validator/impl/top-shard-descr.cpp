@@ -62,12 +62,10 @@ td::Status ShardTopBlockDescrQ::unpack_one_proof(BlockIdExt& cur_id, Ref<vm::Cel
   block::gen::Block::Record blk;
   block::gen::BlockInfo::Record info;
   block::gen::BlockExtra::Record extra;
-  block::gen::ValueFlow::Record flow;
-  block::CurrencyCollection fees_collected, funds_created;
+  block::ValueFlow flow;
   if (!(tlb::unpack_cell(virt_root, blk) && tlb::unpack_cell(blk.info, info) && !info.version &&
-        block::gen::t_ValueFlow.force_validate_ref(blk.value_flow) && tlb::unpack_cell(blk.value_flow, flow) &&
-        /*tlb::unpack_cell(blk.extra, extra) &&*/ fees_collected.unpack(flow.fees_collected) &&
-        funds_created.unpack(flow.r2.created))) {
+        flow.unpack(vm::load_cell_slice_ref(blk.value_flow)))
+      /*&& tlb::unpack_cell(blk.extra, extra)*/) {
     return td::Status::Error(-666, "cannot unpack block header in link for block "s + cur_id.to_str());
   }
   // remove this "try ... catch ..." later and uncomment tlb::unpack_cell(blk.extra, extra) in the previous condition
@@ -131,7 +129,7 @@ td::Status ShardTopBlockDescrQ::unpack_one_proof(BlockIdExt& cur_id, Ref<vm::Cel
   }
   chain_mc_blk_ids_.push_back(mc_blkid);
   chain_blk_ids_.push_back(cur_id);
-  chain_fees_.emplace_back(std::move(fees_collected), std::move(funds_created));
+  chain_fees_.emplace_back(std::move(flow.fees_collected), std::move(flow.created));
   creators_.push_back(extra.created_by);
   if (!is_head) {
     if (info.after_split || info.after_merge) {
@@ -177,9 +175,11 @@ td::Status ShardTopBlockDescrQ::unpack() {
   block::gen::TopBlockDescr::Record rec;
   if (!(block::gen::t_TopBlockDescr.force_validate_ref(root_) && tlb::unpack_cell(root_, rec) &&
         block::tlb::t_BlockIdExt.unpack(rec.proof_for.write(), block_id_))) {
-    std::cerr << "invalid ShardTopBlockDescr: ";
-    block::gen::t_TopBlockDescr.print_ref(std::cerr, root_);
-    vm::load_cell_slice(root_).print_rec(std::cerr);
+    FLOG(INFO) {
+      sb << "invalid ShardTopBlockDescr: ";
+      block::gen::t_TopBlockDescr.print_ref(sb, root_);
+      vm::load_cell_slice(root_).print_rec(sb);
+    };
     return td::Status::Error(-666, "Shard top block description is not a valid TopBlockDescr TL-B object");
   }
   LOG(DEBUG) << "unpacking a ShardTopBlockDescr for " << block_id_.to_str() << " with " << rec.len << " links";

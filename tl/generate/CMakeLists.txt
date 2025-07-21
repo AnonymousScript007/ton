@@ -1,5 +1,3 @@
-cmake_minimum_required(VERSION 3.0.2 FATAL_ERROR)
-
 file(MAKE_DIRECTORY auto/tl)
 
 set(TL_TON_API

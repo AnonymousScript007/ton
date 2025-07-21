@@ -1,5 +1,3 @@
-cmake_minimum_required(VERSION 3.0.2 FATAL_ERROR)
-
 set(TL_UTILS_SOURCE
   common-utils.hpp
   tl-utils.hpp

@@ -112,6 +112,7 @@ void ValidatorEngineConsole::run() {
   add_query_runner(std::make_unique<QueryRunnerImpl<ExportPublicKeyFileQuery>>());
   add_query_runner(std::make_unique<QueryRunnerImpl<SignQuery>>());
   add_query_runner(std::make_unique<QueryRunnerImpl<SignFileQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<ExportAllPrivateKeysQuery>>());
   add_query_runner(std::make_unique<QueryRunnerImpl<AddAdnlAddrQuery>>());
   add_query_runner(std::make_unique<QueryRunnerImpl<AddDhtIdQuery>>());
   add_query_runner(std::make_unique<QueryRunnerImpl<AddValidatorPermanentKeyQuery>>());
@@ -134,6 +135,27 @@ void ValidatorEngineConsole::run() {
   add_query_runner(std::make_unique<QueryRunnerImpl<CreateProposalVoteQuery>>());
   add_query_runner(std::make_unique<QueryRunnerImpl<CreateComplaintVoteQuery>>());
   add_query_runner(std::make_unique<QueryRunnerImpl<CheckDhtServersQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<SignCertificateQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<ImportCertificateQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<GetOverlaysStatsQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<GetOverlaysStatsJsonQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<ImportShardOverlayCertificateQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<SignShardOverlayCertificateQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<GetActorStatsQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<GetPerfTimerStatsJsonQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<GetShardOutQueueSizeQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<SetExtMessagesBroadcastDisabledQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<AddCustomOverlayQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<DelCustomOverlayQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<ShowCustomOverlaysQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<SetStateSerializerEnabledQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<SetCollatorOptionsJsonQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<ResetCollatorOptionsQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<GetCollatorOptionsJsonQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<GetAdnlStatsJsonQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<GetAdnlStatsQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<AddShardQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<DelShardQuery>>());
 }
 
 bool ValidatorEngineConsole::envelope_send_query(td::BufferSlice query, td::Promise<td::BufferSlice> promise) {
@@ -162,7 +184,10 @@ bool ValidatorEngineConsole::envelope_send_query(td::BufferSlice query, td::Prom
   return true;
 }
 
-void ValidatorEngineConsole::got_result() {
+void ValidatorEngineConsole::got_result(bool success) {
+  if (!success && ex_mode_) {
+    std::_Exit(2);
+  }
   running_queries_--;
   if (!running_queries_ && ex_queries_.size() > 0) {
     auto data = std::move(ex_queries_[0]);
@@ -181,9 +206,8 @@ void ValidatorEngineConsole::show_help(std::string command, td::Promise<td::Buff
       td::TerminalIO::out() << cmd.second->help() << "\n";
     }
   } else {
-    auto it = query_runners_.find(command);
-    if (it != query_runners_.end()) {
-      td::TerminalIO::out() << it->second->help() << "\n";
+    if (auto query = get_query(command)) {
+      td::TerminalIO::out() << query->help() << "\n";
     } else {
       td::TerminalIO::out() << "unknown command '" << command << "'\n";
     }
@@ -207,10 +231,9 @@ void ValidatorEngineConsole::parse_line(td::BufferSlice data) {
   }
   auto name = tokenizer.get_token<std::string>().move_as_ok();
 
-  auto it = query_runners_.find(name);
-  if (it != query_runners_.end()) {
+  if (auto query = get_query(name)) {
     running_queries_++;
-    it->second->run(actor_id(this), std::move(tokenizer));
+    query->run(actor_id(this), std::move(tokenizer));
   } else {
     td::TerminalIO::out() << "unknown command '" << name << "'\n";
   }
@@ -258,7 +281,8 @@ int main(int argc, char* argv[]) {
     std::exit(2);
   });
   p.add_option('V', "version", "shows validator-engine-console build information", [&]() {
-    std::cout << "validator-engine-console build information: [ Commit: " << GitMetadata::CommitSHA1() << ", Date: " << GitMetadata::CommitDate() << "]\n";
+    std::cout << "validator-engine-console build information: [ Commit: " << GitMetadata::CommitSHA1()
+              << ", Date: " << GitMetadata::CommitDate() << "]\n";
     std::exit(0);
   });
   p.add_checked_option('a', "address", "server address", [&](td::Slice arg) {
