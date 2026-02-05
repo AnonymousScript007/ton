@@ -40,7 +40,7 @@
 
 
 
-Main TON monorepo, which includes the code of the node/validator, lite-client, tonlib, FunC compiler, etc.
+Main TON Foundation, which includes the code of the node/validator, lite-client, tonlib, FunC compiler, etc.
 
 ## The Open Network
 
